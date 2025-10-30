@@ -1,0 +1,45 @@
+# epo_runner.py
+from PySide6 import QtWidgets, QtCore
+from load_screen import SplashWindow, LoadingOverlay
+from epo_consolidador import EpoConsolidador
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Consolidador EPO")
+        self.resize(1280, 780)
+
+        # Widget central: EPO
+        self.epo = EpoConsolidador(self)
+        self.setCentralWidget(self.epo)
+
+        # Overlay para procesos (si quieres usarlo después)
+        self.overlay = LoadingOverlay("EPO", "Preparando…", self)
+        self.overlay.hide()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        # Mantener overlay centrado
+        if self.overlay is not None:
+            self.overlay.setGeometry(self.rect())
+
+def run():
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    # Splash inicial
+    splash = SplashWindow("EPO", "Inicializando módulos…")
+    splash.centerOnScreen()
+    splash.show()
+
+    win = MainWindow()
+
+    # Simulamos carga breve y mostramos la ventana principal
+    def _show_main():
+        splash.close()
+        win.show()
+
+    QtCore.QTimer.singleShot(700, _show_main)
+    app.exec()
+
+if __name__ == "__main__":
+    run()
