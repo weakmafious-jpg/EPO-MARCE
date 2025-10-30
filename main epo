@@ -1,0 +1,32 @@
+# main.py
+from PySide6 import QtCore, QtWidgets
+import sys, os
+
+def _set_qt_attrs():
+    # DPI/escala nítida
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+
+def _install_excepthook():
+    def handle_exc(exc_type, exc, tb):
+        import traceback
+        msg = "".join(traceback.format_exception(exc_type, exc, tb))
+        QtWidgets.QMessageBox.critical(None, "Error no controlado", msg)
+        sys.__excepthook__(exc_type, exc, tb)
+    sys.excepthook = handle_exc
+
+def main():
+    _set_qt_attrs()
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    app.setApplicationName("Consolidador EPO")
+    _install_excepthook()
+
+    # Asegura que el cwd sea el del script (útil si lo ejecutas desde accesos directos)
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+    # Lanza el runner
+    from epo_runner import run
+    run()
+
+if __name__ == "__main__":
+    main()
