@@ -1,0 +1,169 @@
+# load_screen.py
+from PySide6 import QtCore, QtGui, QtWidgets
+
+# === Paleta consistente con tu estilo ===
+BG      = "#0d1014"
+SURF0   = "#13161b"
+SURF1   = "#161a20"
+BORDER  = "#242a33"
+ACCENT  = "#2b66f6"
+TEXT    = "#e9ecf1"
+TEXT_M  = "#a7aeb7"
+
+class PulsingDot(QtWidgets.QWidget):
+    def __init__(self, size=24, pulse_scale=2.6, parent=None):
+        super().__init__(parent)
+        self._base = size
+        self._pulse = 0.0
+        self._pulse_scale = pulse_scale
+        self.setFixedSize(size*int(pulse_scale*1.4), size*int(pulse_scale*1.4))
+        self._anim = QtCore.QPropertyAnimation(self, b"pulse", self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setLoopCount(-1)
+        self._anim.setDuration(1200)
+        self._anim.setEasingCurve(QtCore.QEasingCurve.InOutSine)
+
+    @QtCore.Property(float)
+    def pulse(self):
+        return self._pulse
+
+    @pulse.setter
+    def pulse(self, v):
+        self._pulse = float(v)
+        self.update()
+
+    def start(self): self._anim.start()
+    def stop(self):  self._anim.stop()
+
+    def paintEvent(self, e):
+        r = self._base/2
+        center = self.rect().center()
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.fillRect(self.rect(), QtCore.Qt.transparent)
+
+        # Anillo exterior que crece y se desvanece
+        growth = 1.0 + self._pulse*(self._pulse_scale-1.0)
+        alpha  = int(120*(1.0-self._pulse))
+        pen = QtGui.QPen(QtGui.QColor(ACCENT))
+        pen.setWidthF(2.0)
+        pen.setColor(QtGui.QColor(ACCENT))
+        pen.setColor(QtGui.QColor(42,102,246, alpha))
+        p.setPen(pen)
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.drawEllipse(center, r*growth, r*growth)
+
+        # Círculo base
+        body = QtGui.QColor(ACCENT)
+        body.setAlpha(220)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(body)
+        p.drawEllipse(center, r, r)
+
+        # Núcleo
+        core = QtGui.QColor("#0b1224")
+        core.setAlpha(200)
+        p.setBrush(core)
+        p.drawEllipse(center, r*0.45, r*0.45)
+        p.end()
+
+
+class LoadingOverlay(QtWidgets.QWidget):
+    """Overlay semitransparente con título + dot pulsante."""
+    def __init__(self, title="ETL", subtitle="Cargando…", parent=None):
+        super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
+        self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
+        self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.Tool)
+        self.setAutoFillBackground(False)
+
+        # Fondo translúcido
+        self._bg = QtWidgets.QWidget(self)
+        self._bg.setStyleSheet(f"background: rgba(7,10,14,190); border: 1px solid {BORDER}; border-radius: 16px;")
+
+        # Contenido
+        self.dot = PulsingDot(size=26, pulse_scale=2.6)
+        self.title = QtWidgets.QLabel(title)
+        self.title.setStyleSheet(f"color:{TEXT}; font-weight:800; font-size:22px;")
+        self.subtitle = QtWidgets.QLabel(subtitle)
+        self.subtitle.setStyleSheet(f"color:{TEXT_M}; font-size:14px;")
+        self.subtitle.setAlignment(QtCore.Qt.AlignCenter)
+
+        col = QtWidgets.QVBoxLayout()
+        col.setContentsMargins(28, 24, 28, 24)
+        col.setSpacing(10)
+        col.addWidget(self.title, 0, QtCore.Qt.AlignHCenter)
+        col.addWidget(self.dot, 0, QtCore.Qt.AlignHCenter)
+        col.addWidget(self.subtitle, 0, QtCore.Qt.AlignHCenter)
+
+        self._bg.setLayout(col)
+        self.hide()
+
+    def resizeEvent(self, e):
+        if self.parent():
+            self.setGeometry(self.parent().rect())
+        # caja central
+        w, h = 290, 200
+        cx = (self.width()-w)//2
+        cy = (self.height()-h)//2
+        self._bg.setGeometry(cx, cy, w, h)
+
+    # API pública
+    def setTexts(self, title=None, subtitle=None):
+        if title is not None: self.title.setText(title)
+        if subtitle is not None: self.subtitle.setText(subtitle)
+
+    def showOverlay(self, subtitle="Procesando…"):
+        self.setTexts(subtitle=subtitle)
+        if self.parent() is not None and not self.isVisible():
+            self.raise_()
+            self.show()
+            self.dot.start()
+
+    def hideOverlay(self):
+        self.dot.stop()
+        self.hide()
+
+
+class SplashWindow(QtWidgets.QWidget):
+    """Splash flotante al abrir la app."""
+    def __init__(self, title="ETL", tagline="Inicializando módulos…"):
+        super().__init__(None)
+        self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.SplashScreen)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(460, 280)
+
+        card = QtWidgets.QFrame()
+        card.setStyleSheet(f"""
+            QFrame {{
+                background-color:{SURF0};
+                border: 1px solid {BORDER};
+                border-radius: 18px;
+            }}
+        """)
+
+        logo = QtWidgets.QLabel(title)
+        logo.setStyleSheet(f"color:{TEXT}; font-weight:900; letter-spacing:1px; font-size:28px;")
+        dot = PulsingDot(size=30, pulse_scale=2.7)
+        dot.start()
+        sub = QtWidgets.QLabel(tagline)
+        sub.setStyleSheet(f"color:{TEXT_M}; font-size:14px;")
+        sub.setAlignment(QtCore.Qt.AlignCenter)
+
+        v = QtWidgets.QVBoxLayout(card)
+        v.setContentsMargins(24, 22, 24, 22)
+        v.setSpacing(12)
+        v.addWidget(logo, 0, QtCore.Qt.AlignHCenter)
+        v.addWidget(dot, 0, QtCore.Qt.AlignHCenter)
+        v.addWidget(sub)
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(0,0,0,0)
+        root.addWidget(card)
+
+    def centerOnScreen(self):
+        geo = self.frameGeometry()
+        scr = QtWidgets.QApplication.primaryScreen().geometry()
+        geo.moveCenter(scr.center())
+        self.move(geo.topLeft())
