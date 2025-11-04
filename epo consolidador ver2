@@ -1,0 +1,1309 @@
+from PySide6 import QtWidgets, QtGui, QtCore
+import sys, os, re, datetime as dt
+from typing import Dict, Tuple, List, Optional, Any
+from collections import defaultdict, OrderedDict
+
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.worksheet.worksheet import Worksheet
+    from openpyxl.utils import get_column_letter
+except Exception:
+    Workbook = None
+    def load_workbook(*a, **k): raise ImportError("openpyxl requerido")
+    Worksheet = Any
+
+BG="#0d1014"; SURF0="#13161b"; SURF1="#161a20"; SURF2="#0f1217"; BORDER="#242a33"; RADIUS=14
+ACCENT="#2b66f6"; TEXT="#e9ecf1"; TEXT_M="#a7aeb7"; OK="#17b26a"; WARN="#f59e0b"; BAD="#ef4444"
+
+MONTHS_MAP={"ene":1,"enero":1,"feb":2,"febrero":2,"mar":3,"marzo":3,"abr":4,"abril":4,"may":5,"mayo":5,"jun":6,"junio":6,
+            "jul":7,"julio":7,"ago":8,"agosto":8,"sep":9,"sept":9,"septiembre":9,"oct":10,"octubre":10,"nov":11,"noviembre":11,
+            "dic":12,"diciembre":12}
+SPAN_MONTHS=["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
+NUM_RX=re.compile(r"[^\d\-\.,]")
+
+def _to_float(x) -> float:
+    if x is None: return 0.0
+    s=str(x).strip()
+    if s=="" or s.lower() in ("nan","none","-","--"): return 0.0
+    s=NUM_RX.sub("",s).replace(",",".")
+    try: return float(s)
+    except: return 0.0
+
+def _norm_text(s: str) -> str:
+    t = (str(s) if s is not None else "").strip().lower()
+    t = re.sub(r"[\n\r]+"," ", t)
+    t = re.sub(r"\s+"," ", t)
+    t = t.replace(".","").replace(",","")
+    repl = {"á":"a","é":"e","í":"i","ó":"o","ú":"u","ñ":"n","ü":"u"}
+    t = "".join(repl.get(ch, ch) for ch in t)
+    return t
+
+_CORP_SUFFIX_RX = re.compile(
+    r"\b(s\.?\s?a\.?(?:\s?de)?\s?c\.?\s?v\.?|s\.?\s?de\s?r\.?\s?l\.?\s?de\s?c\.?\s?v\.?|inc\.?|corp\.?|co\.?|ltd\.?)\b",
+    re.IGNORECASE,
+)
+_PUNCT_RX = re.compile(r"[^\w\s]")
+
+def _norm_relaxed(s: str) -> str:
+    t = _norm_text(s)
+    t = _CORP_SUFFIX_RX.sub("", t)
+    t = _PUNCT_RX.sub(" ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+ALIASES = {"ghtlink": "ght link", "beifa": "beifa import"}
+def _apply_alias(p: str) -> str:
+    return ALIASES.get(_norm_relaxed(p), p)
+
+def _jaccard(a: str, b: str) -> float:
+    sa = set(_norm_relaxed(a).split()); sb = set(_norm_relaxed(b).split())
+    if not sa or not sb: return 0.0
+    inter=len(sa & sb); uni=len(sa | sb)
+    return inter/uni if uni else 0.0
+
+def _best_match_relaxed(target: str, pool_keys: List[str], min_sim: float=0.55) -> Optional[str]:
+    t = _norm_relaxed(target)
+    if t in pool_keys: return t
+    for k in pool_keys:
+        if t in k or k in t: return k
+    best_k=None; best_sc=0.0; sa=set(t.split())
+    for k in pool_keys:
+        sb=set(k.split())
+        sc = (len(sa & sb)/len(sa | sb)) if (sa and sb) else 0.0
+        if sc>best_sc: best_sc=sc; best_k=k
+    return best_k if best_sc>=min_sim else None
+
+def _parse_spanish_h1_date(texto: str):
+    if not texto: return "", None, None
+    t=str(texto).strip().lower()
+    t=re.sub(r"\s+"," ",t)
+    m=re.search(r"(?:\d{1,2}\s+de\s+)?([a-záéíóú]+)(?:\s+de)?\s+(\d{4})", t)
+    if not m: return "", None, None
+    mes_pal=m.group(1); anio=int(m.group(2))
+    mes=MONTHS_MAP.get(mes_pal[:3], None)
+    if not mes: return "", None, None
+    return f"{anio:04d}-{mes:02d}", anio, mes
+
+def _detect_mes_anio_from_editable(path_editable: str, sheet_name=0):
+    try:
+        h1 = pd.read_excel(path_editable, sheet_name=sheet_name, header=None, nrows=1, usecols="H").iat[0,0]
+    except Exception:
+        return "", None, None
+    return _parse_spanish_h1_date(h1)
+
+def _safe_sheet_name(name: str) -> str:
+    name = (name or "").strip()
+    name = re.sub(r"[\[\]\:\*\?\/\\]", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    if not name: name = "Cliente"
+    return name[:31]
+
+def _get_template_path() -> str:
+    fname = "Form_EPO_Marce.xlsx"
+    base_dirs: List[str] = []
+    if hasattr(sys, "_MEIPASS") and sys._MEIPASS:
+        base_dirs.append(sys._MEIPASS)
+    if getattr(sys, "frozen", False):
+        try:
+            base_dirs.append(os.path.dirname(sys.executable))
+        except Exception:
+            pass
+    try:
+        base_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+    base_dirs.append(os.getcwd())
+    for base in base_dirs:
+        p = os.path.join(base, "plantillas", fname)
+        if os.path.exists(p):
+            return p
+    for base in base_dirs:
+        p = os.path.join(base, fname)
+        if os.path.exists(p):
+            return p
+    detail = "\n".join(f" - {b}" for b in base_dirs)
+    raise FileNotFoundError(
+        "No se encontró 'Form_EPO_Marce.xlsx'.\nRutas probadas:\n"+detail+"\n\nInclúyela al empaquetar (PyInstaller):\n  --add-data \"plantillas\\Form_EPO_Marce.xlsx;plantillas\"\n  --add-data \"plantillas/Form_EPO_Marce.xlsx:plantillas\"\no colócala junto al EXE dentro de 'plantillas/'."
+    )
+
+def _scan_template_grid(ws: Worksheet) -> Tuple[Dict[int, Tuple[int,int]], Dict[int, int], Dict[int,int], int]:
+    month_blocks: Dict[int, Tuple[int,int]] = {}
+    current_mm=None; start=None
+    max_col = ws.max_column
+    for c in range(1, max_col+1):
+        v = str(ws.cell(row=4, column=c).value or "").strip().lower()
+        mm=None
+        for k,vv in MONTHS_MAP.items():
+            if k in v and v!="":
+                mm=vv; break
+        if mm is not None:
+            if current_mm is not None and start is not None:
+                month_blocks[current_mm]=(start, c-1)
+            current_mm=mm; start=c
+    if current_mm is not None and start is not None:
+        month_blocks[current_mm]=(start, max_col)
+    providers = {}
+    # FIX: había "range(1 1, max_col+1)"
+    for c in range(1, max_col+1):
+        name = str(ws.cell(row=5, column=c).value or "").strip()
+        if not name: continue
+        if "total" in name.lower(): continue
+        providers[c]=c
+    cat_row={}
+    r=6; blanks=0
+    while r <= ws.max_row:
+        val = ws.cell(row=r, column=1).value
+        if val is None or str(val).strip()=="":
+            blanks+=1
+            if blanks>=2: break
+            r+=1; continue
+        if "total" in str(val).strip().lower():
+            break
+        cat_row[r]=r
+        r+=1
+    first_data_row=6
+    return month_blocks, providers, cat_row, first_data_row
+
+def _detect_total_row(ws: Worksheet) -> int:
+    try:
+        for r in range(6, ws.max_row + 1):
+            val = ws.cell(row=r, column=1).value
+            if val and "total" in str(val).strip().lower():
+                return r
+    except Exception:
+        pass
+    try:
+        _, _, cat_rows, _ = _scan_template_grid(ws)
+        if cat_rows:
+            return max(cat_rows.keys()) + 1
+    except Exception:
+        pass
+    return 69
+
+def validar_total_categoria(ws: Worksheet):
+    total_row = _detect_total_row(ws)
+    month_blocks, _, cat_rows, _ = _scan_template_grid(ws)
+    for mm, (c1, c2) in month_blocks.items():
+        total_col = c2
+        for r in cat_rows.keys():
+            if r >= total_row:
+                continue
+            vals = [_to_float(ws.cell(row=r, column=c).value) for c in range(c1, c2)]
+            suma = sum(vals[:-1])
+            total_val = _to_float(ws.cell(row=r, column=total_col).value)
+            if abs(suma - total_val) > 0.01:
+                print(f"[WARN] Fila {r}: suma {suma} != total {total_val}")
+
+def validar_ytd_no_decreciente(ws: Worksheet):
+    total_row = _detect_total_row(ws)
+    month_blocks, _, _, _ = _scan_template_grid(ws)
+    prev_vals = [0.0] * 16
+    for mm in sorted(month_blocks.keys()):
+        c1, c2 = month_blocks[mm]
+        vals = [_to_float(ws.cell(row=total_row, column=c).value) for c in range(c1, c2)]
+        for i, v in enumerate(vals):
+            if v < prev_vals[i]:
+                print(f"[WARN] Mes {mm}: decreciente en proveedor {i+1} ({prev_vals[i]} to {v})")
+        prev_vals = vals
+
+def _make_maps_by_name(ws: Worksheet) -> Tuple[Dict[str,int], Dict[str,int]]:
+    cat_map={}; cat_relaxed={}
+    r=6
+    while r<=ws.max_row:
+        val = ws.cell(row=r, column=1).value
+        if val is None or str(val).strip()=="":
+            r+=1; continue
+        txt=str(val).strip()
+        if "total" in txt.lower(): break
+        cat_map[_norm_text(txt)] = r
+        cat_relaxed[_norm_relaxed(txt)] = r
+        r+=1
+    prov_map={}; prov_relaxed={}
+    for c in range(1, ws.max_column+1):
+        name = ws.cell(row=5, column=c).value
+        if name is None: continue
+        name=str(name).strip()
+        if name=="" or "total" in name.lower(): continue
+        prov_map[_norm_text(name)] = c
+        prov_relaxed[_norm_relaxed(name)] = c
+    ws._prov_relaxed = prov_relaxed
+    ws._cat_relaxed = cat_relaxed
+    return cat_map, prov_map
+
+def _read_epo_sheet_as_records(ws: Worksheet) -> List[Tuple[str,str,int,float]]:
+    month_blocks, providers_cols, cat_rows, _ = _scan_template_grid(ws)
+    if not month_blocks: return []
+    prov_by_col={c: str(ws.cell(row=5, column=c).value or "").strip() for c in providers_cols.keys()}
+    records=[]
+    for mm,(c1,c2) in month_blocks.items():
+        has_data=False
+        for r in cat_rows.keys():
+            for c in range(c1, c2+1):
+                v=_to_float(ws.cell(row=r, column=c).value)
+                if v!=0.0:
+                    has_data=True; break
+            if has_data: break
+        if not has_data: continue
+        for r in cat_rows.keys():
+            cat = str(ws.cell(row=r, column=1).value or "").strip()
+            if not cat: continue
+            if "total" in cat.lower(): continue
+            for c in range(c1, c2+1):
+                prov = prov_by_col.get(c, "")
+                if not prov or "total" in prov.lower(): continue
+                v=_to_float(ws.cell(row=r, column=c).value)
+                if v!=0.0:
+                    records.append((cat, prov, mm, v))
+    return records
+
+def _write_records_into_template(ws: Worksheet, records: List[Tuple[str,str,int,float]]):
+    if not records: return
+    cat_map, prov_map = _make_maps_by_name(ws)
+    month_blocks, _, _, _ = _scan_template_grid(ws)
+    if not month_blocks: return
+    prov_relaxed = getattr(ws, "_prov_relaxed", {})
+    cat_relaxed  = getattr(ws, "_cat_relaxed", {})
+    prov_keys_rel = list(prov_relaxed.keys())
+    cat_keys_rel  = list(cat_relaxed.keys())
+    for cat, prov_raw, mm, val in records:
+        if mm not in month_blocks: continue
+        prov = _apply_alias(prov_raw)
+        r = cat_map.get(_norm_text(cat))
+        if r is None:
+            r = cat_relaxed.get(_norm_relaxed(cat))
+        if r is None:
+            k = _best_match_relaxed(cat, cat_keys_rel, min_sim=0.55)
+            if k is not None: r = cat_relaxed.get(k)
+        if r is None: continue
+        c = prov_map.get(_norm_text(prov))
+        if c is None:
+            c = getattr(ws, "_prov_relaxed", {}).get(_norm_relaxed(prov))
+        col_ini, col_fin = month_blocks[mm]
+        target_c = None
+        if c is not None and (col_ini <= c <= col_fin):
+            target_c = c
+        else:
+            prov_rel = _norm_relaxed(prov)
+            for cc in range(col_ini, col_fin+1):
+                name = str(ws.cell(row=5, column=cc).value or "").strip()
+                if not name or "total" in name.lower(): continue
+                name_rel = _norm_relaxed(name)
+                if name_rel == prov_rel or prov_rel in name_rel or name_rel in prov_rel:
+                    target_c = cc; break
+            if target_c is None:
+                best_cc=None; best_sc=0.0
+                for cc in range(col_ini, col_fin+1):
+                    name=str(ws.cell(row=5, column=cc).value or "").strip()
+                    if not name or "total" in name.lower(): continue
+                    sc=_jaccard(prov, name)
+                    if sc>best_sc: best_sc=sc; best_cc=cc
+                if best_sc>=0.55: target_c=best_cc
+        if target_c is None: continue
+        cell = ws.cell(row=r, column=target_c)
+        prev=_to_float(cell.value)
+        cell.value = prev + float(val)
+
+def _paste_literal_grid(new_ws: Worksheet, src_ws: Worksheet):
+    month_blocks_dst, providers_cols_dst, cat_rows_dst, _ = _scan_template_grid(new_ws)
+    if not month_blocks_dst or not providers_cols_dst or not cat_rows_dst:
+        return
+    month_blocks_src, providers_cols_src, cat_rows_src, _ = _scan_template_grid(src_ws)
+    if not month_blocks_src or not providers_cols_src or not cat_rows_src:
+        return
+    min_row = max(6, min(cat_rows_dst.keys()))
+    max_row = max(cat_rows_dst.keys())
+    for mm, (c1_dst, c2_dst) in month_blocks_dst.items():
+        if mm not in month_blocks_src:
+            continue
+        c1_src, c2_src = month_blocks_src[mm]
+        width = min(c2_dst - c1_dst + 1, c2_src - c1_src + 1)
+        for r in range(min_row, max_row + 1):
+            head = str(new_ws.cell(row=r, column=1).value or "").strip().lower()
+            if head == "" or "total" in head:
+                continue
+            for offset in range(width):
+                c_dst = c1_dst + offset
+                c_src = c1_src + offset
+                fv = _to_float(src_ws.cell(row=r, column=c_src).value)
+                if fv != 0.0:
+                    prev = _to_float(new_ws.cell(row=r, column=c_dst).value)
+                    new_ws.cell(row=r, column=c_dst, value=prev + fv)
+
+def _col_idx(col: str) -> int:
+    idx = 0
+    for ch in col.strip().upper():
+        idx = idx * 26 + (ord(ch) - 64)
+    return idx
+
+def _force_paste_december_block(new_ws: Worksheet, src_ws: Worksheet):
+    month_blocks_src, _, _, _ = _scan_template_grid(src_ws)
+    if 12 not in month_blocks_src:
+        return
+    c1_src, c2_src = month_blocks_src[12]
+    c1_dst = _col_idx("GG")
+    c2_dst = _col_idx("GW")
+    width_src = c2_src - c1_src + 1
+    width_dst = c2_dst - c1_dst + 1
+    width = min(width_src, width_dst)
+    total_row = _detect_total_row(src_ws)
+    for r in range(6, total_row + 1):
+        for off in range(width):
+            fv = _to_float(src_ws.cell(row=r, column=c1_src + off).value)
+            if fv != 0.0:
+                new_ws.cell(row=r, column=c1_dst + off, value=fv)
+
+class FullFormatDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None, df=None):
+        super().__init__(parent)
+        self.setWindowTitle("Comparativa avanzada")
+        self.resize(1200, 780)
+        self.setModal(True)
+        self.setStyleSheet(f"""
+            QDialog{{background:{BG};color:{TEXT};}}
+            QLineEdit{{background:{SURF1};border:1px solid {BORDER};border-radius:10px;padding:8px 10px;color:{TEXT};selection-background-color:{ACCENT};}}
+            QLineEdit:focus{{border:1px solid {ACCENT};}}
+            QPushButton#ghost{{background:{SURF1};border:1px solid {BORDER};color:{TEXT};border-radius:10px;padding:8px 12px;}}
+            QPushButton#ghost:hover{{border-color:{ACCENT};}}
+            QTableWidget{{background:{SURF1};border:1px solid {BORDER};border-radius:{RADIUS-2}px;}}
+            QHeaderView::section{{background:{SURF1};color:{TEXT_M};border:none;padding:6px;font-weight:700;}}
+            QTableCornerButton::section{{background:{SURF1};border:0px;}}
+            QScrollBar:vertical{{background:{SURF1};width:12px;border:none;border-radius:6px;}}
+            QScrollBar::handle:vertical{{background:{ACCENT};min-height:24px;border-radius:6px;}}
+            QScrollBar:horizontal{{background:{SURF1};height:12px;border:none;border-radius:6px;}}
+            QScrollBar::handle:horizontal{{background:{ACCENT};min-width:24px;border-radius:6px;}}
+        """)
+        self._source_df = df[["proveedor","categoria","mes","valor"]].copy() if (df is not None and not df.empty) else (pd.DataFrame(columns=["proveedor","categoria","mes","valor"]) if pd is not None else None)
+        v = QtWidgets.QVBoxLayout(self); v.setContentsMargins(12,12,12,12); v.setSpacing(8)
+        top = QtWidgets.QHBoxLayout()
+        self.search = QtWidgets.QLineEdit(); self.search.setPlaceholderText("Buscar proveedor o categoría…")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._apply_filter)
+        top.addWidget(self.search, 1)
+        btnClose = QtWidgets.QPushButton("Cerrar", objectName="ghost"); btnClose.clicked.connect(self.accept)
+        btnClose.setFocusPolicy(QtCore.Qt.NoFocus)
+        top.addWidget(btnClose)
+        v.addLayout(top)
+        self.table = QtWidgets.QTableWidget(); v.addWidget(self.table,1)
+        if pd is not None:
+            self._build_pivot(self._source_df)
+
+    def _build_pivot(self, df):
+        if df is None or df.empty:
+            self.table.setRowCount(0); self.table.setColumnCount(0); return
+        df2 = df.copy()
+        df2 = df2[df2["mes"]!=""]
+        if df2.empty:
+            self.table.setRowCount(0); self.table.setColumnCount(0); return
+        df2["mes_txt"]=df2["mes"].str[-2:].astype(int)
+        piv = df2.pivot_table(index=["proveedor","categoria"], columns="mes_txt",
+                              values="valor", aggfunc="sum", fill_value=0.0)
+        piv = piv.reindex(columns=list(range(1,13)), fill_value=0.0)
+        piv.columns = [m[:3] for m in SPAN_MONTHS]
+        piv["Total"]=piv.sum(axis=1)
+        tot = float(piv["Total"].sum()) or 1.0
+        piv["Participación"]=piv["Total"]/tot
+        self._piv = piv.reset_index()
+        self._render(self._piv)
+
+    def _apply_filter(self, text):
+        if not hasattr(self, "_piv") or self._piv is None:
+            return
+        t = (text or "").strip().lower()
+        if t == "":
+            df = self._piv
+        else:
+            m1 = self._piv["proveedor"].astype(str).str.lower().str.contains(t, na=False)
+            m2 = self._piv["categoria"].astype(str).str.lower().str.contains(t, na=False)
+            df = self._piv[m1 | m2]
+        self._render(df)
+
+    def _render(self, df_show):
+        months_short = [m[:3] for m in SPAN_MONTHS]
+        cols=["Proveedor","Categoría"]+months_short+["Total","Participación"]
+        self.table.setColumnCount(len(cols)); self.table.setHorizontalHeaderLabels(cols)
+        self.table.setRowCount(len(df_show))
+        for r in range(len(df_show)):
+            self.table.setItem(r,0,QtWidgets.QTableWidgetItem(str(df_show.iat[r,0])))
+            self.table.setItem(r,1,QtWidgets.QTableWidgetItem(str(df_show.iat[r,1])))
+            for i in range(12):
+                self.table.setItem(r,2+i,QtWidgets.QTableWidgetItem(f"{df_show.iat[r,2+i]:,.0f}"))
+            self.table.setItem(r,14,QtWidgets.QTableWidgetItem(f"{df_show.iat[r,14]:,.0f}"))
+            self.table.setItem(r,15,QtWidgets.QTableWidgetItem(f"{df_show.iat[r,15]*100:,.2f}%"))
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+
+class EpoConsolidador(QtWidgets.QWidget):
+    backRequested = QtCore.Signal()
+
+    def __init__(self, parent=None, router=None):
+        super().__init__(parent)
+        self.router = router
+        app=QtWidgets.QApplication.instance()
+        if app:
+            app.setStyleSheet(app.styleSheet()+f"""
+                QWidget{{background:{BG};color:{TEXT};font-size:13px;}}
+                QLabel#h1{{font-size:21px;font-weight:800;}}
+                QLabel#kpiLabel{{color:{TEXT_M};font-weight:700;}}
+                QLabel#kpiValue{{color:#ffffff;font-size:22px;font-weight:800;}}
+                QFrame.card{{background:{SURF0};border:1px solid rgba(0,0,0,0);border-radius:{RADIUS}px;}}
+                QPushButton#primary{{background:{ACCENT};border:1px solid {ACCENT};color:#fff;border-radius:10px;padding:10px 12px;font-weight:700;}}
+                QPushButton#primary:hover{{background:#3a72ff;}}
+                QPushButton#primary:pressed{{background:#1f4fd1;border-color:#1f4fd1;}}
+                QPushButton#ghost{{background:{SURF1};border:1px solid {BORDER};color:{TEXT};border-radius:10px;padding:10px 12px;font-weight:600;}}
+                QPushButton#ghost:hover{{border-color:{ACCENT};}}
+                QPushButton:focus{{outline: none;}}
+                QComboBox{{background:{SURF1};border:1px solid {BORDER};border-radius:10px;color:{TEXT};padding:8px 10px;}}
+                QComboBox:hover{{border-color:{ACCENT};}}
+                QComboBox::drop-down{{width:28px;border-left:1px solid {BORDER};}}
+                QComboBox QAbstractItemView{{background:{SURF1};color:{TEXT};border:1px solid {BORDER};selection-background-color:{ACCENT};}}
+                QTableWidget{{background:{SURF1};border:1px solid {BORDER};color:{TEXT};border-radius:{RADIUS-2}px;}}
+                QHeaderView::section{{background:{SURF1};color:{TEXT_M};border:none;padding:6px;font-weight:700;}}
+                QTableCornerButton::section{{background:{SURF1};border:0px;}}
+                QScrollBar:vertical{{background:{SURF1};width:12px;border:none;border-radius:6px;}}
+                QScrollBar::handle:vertical{{background:{ACCENT};min-height:24px;border-radius:6px;}}
+                QScrollBar:horizontal{{background:{SURF1};height:12px;border:none;border-radius:6px;}}
+                QScrollBar::handle:horizontal{{background:{ACCENT};min-width:24px;border-radius:6px;}}
+            """)
+        self.df = pd.DataFrame(columns=["archivo","kam","cliente","proveedor","categoria","mes","valor","moneda"]) if pd else None
+        self.base_prov = pd.DataFrame(columns=["proveedor","valor"]) if pd else None
+        self.base_month = pd.DataFrame(columns=["mes","valor"]) if pd else None
+        self.base_year = None
+        self.curr_year = None
+        self.group_mode = "proveedor"
+        self._build()
+
+    def _build(self):
+        self.setWindowTitle("Consolidador EPO")
+        root=QtWidgets.QVBoxLayout(self); root.setContentsMargins(12,12,12,12); root.setSpacing(10)
+        top=QtWidgets.QHBoxLayout()
+        lbl_title = QtWidgets.QLabel("Consolidador EPO", objectName="h1")
+        top.addWidget(lbl_title, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        top.addStretch(1)
+        self.btn_add_files=QtWidgets.QPushButton("Agregar archivos", objectName="ghost")
+        self.btn_add_folder=QtWidgets.QPushButton("Agregar carpeta", objectName="ghost")
+        self.btn_load_base=QtWidgets.QPushButton("Cargar base", objectName="ghost")
+        self.btn_remove=QtWidgets.QPushButton("Quitar seleccionados", objectName="ghost")
+        self.btn_export=QtWidgets.QPushButton("Generar Hoja", objectName="primary")
+        self.btn_adv=QtWidgets.QPushButton("Comparativas avanzadas", objectName="ghost")
+        for b in (self.btn_add_files, self.btn_add_folder, self.btn_load_base,
+                  self.btn_remove, self.btn_export, self.btn_adv):
+            b.setFocusPolicy(QtCore.Qt.NoFocus)
+        export_menu = QtWidgets.QMenu(self.btn_export)
+        export_menu.setStyleSheet(f"""
+            QMenu {{
+                background:{SURF1};
+                border:1px solid {BORDER};
+                border-radius:12px;
+                padding:6px;
+            }}
+            QMenu::item {{
+                color:{TEXT};
+                padding:8px 14px;
+                border-radius:8px;
+                font-weight:600;
+            }}
+            QMenu::item:selected {{
+                background:{ACCENT};
+                color:#ffffff;
+            }}
+        """)
+        act_kam = export_menu.addAction("Reporte KAM")
+        act_epo = export_menu.addAction("EPO Ventas")
+        act_kam.triggered.connect(lambda: self._export_total(mode="kam"))
+        act_epo.triggered.connect(lambda: self._export_total(mode="epo"))
+        self.btn_export.setMenu(export_menu)
+        for b in (self.btn_add_files,self.btn_add_folder,self.btn_load_base,self.btn_remove,self.btn_adv,self.btn_export):
+            top.addWidget(b)
+        root.addLayout(top)
+        kpiCard=QtWidgets.QFrame(objectName="card"); kl=QtWidgets.QHBoxLayout(kpiCard)
+        kl.setContentsMargins(12,10,12,10); kl.setSpacing(10)
+        self.kpi_total=self._kpi("Total EPO")
+        self.kpi_provs=self._kpi("Proveedores")
+        self.kpi_clients=self._kpi("Clientes")
+        self.kpi_vs=self._kpi("Vs Base")
+        for k in (self.kpi_total,self.kpi_provs,self.kpi_clients,self.kpi_vs): kl.addWidget(k,1)
+        root.addWidget(kpiCard)
+        grid=QtWidgets.QGridLayout(); grid.setHorizontalSpacing(10); grid.setVerticalSpacing(10)
+        filesCard=QtWidgets.QFrame(objectName="card"); filesCard.setMinimumWidth(260)
+        fv=QtWidgets.QVBoxLayout(filesCard); fv.setContentsMargins(12,10,12,12); fv.setSpacing(6)
+        lbl_files = QtWidgets.QLabel("Archivos KAM"); lbl_files.setStyleSheet("font-weight:800;color:#fff;")
+        fv.addWidget(lbl_files)
+        self.lst_files=QtWidgets.QListWidget()
+        self.lst_files.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.lst_files.setFocusPolicy(QtCore.Qt.NoFocus)
+        fv.addWidget(self.lst_files,1)
+        mainCard=QtWidgets.QFrame(objectName="card"); mv=QtWidgets.QVBoxLayout(mainCard)
+        mv.setContentsMargins(12,10,12,12); mv.setSpacing(6)
+        self.lbl_main_title=QtWidgets.QLabel("Totales", styleSheet="font-weight:800;color:#fff;")
+        mv.addWidget(self.lbl_main_title)
+        opt_row=QtWidgets.QHBoxLayout()
+        lbl_group = QtWidgets.QLabel("Agrupar por:", styleSheet=f"color:{TEXT_M};font-weight:700;")
+        opt_row.addWidget(lbl_group)
+        self.cb_group = QtWidgets.QComboBox(); self.cb_group.addItems(["Proveedor","Mes"])
+        self.cb_group.currentTextChanged.connect(self._switch_group_mode)
+        self.cb_group.setFocusPolicy(QtCore.Qt.NoFocus)
+        opt_row.addStretch(1)
+        opt_row.addWidget(self.cb_group)
+        mv.addLayout(opt_row)
+        self.tbl_main=self._table(["—"])
+        self.tbl_main.setFocusPolicy(QtCore.Qt.NoFocus)
+        mv.addWidget(self.tbl_main,1)
+        grid.addWidget(filesCard,0,0,1,1)
+        grid.addWidget(mainCard,0,1,1,1)
+        grid.setColumnStretch(0,1)
+        grid.setColumnStretch(1,4)
+        root.addLayout(grid,1)
+        self.btn_add_files.clicked.connect(self._add_files)
+        self.btn_add_folder.clicked.connect(self._add_folder)
+        self.btn_load_base.clicked.connect(self._load_base)
+        self.btn_remove.clicked.connect(self._remove_selected_files)
+        self.btn_adv.clicked.connect(self._open_full_format)
+        self._recalc()
+        self.btn_remove.setVisible(False)
+        self.btn_adv.setVisible(False)
+        self._update_button_visibility()
+
+    def _copy_worksheet(self, dst, src):
+        for row in src.iter_rows():
+            for cell in row:
+                new_cell = dst.cell(row=cell.row, column=cell.column, value=cell.value)
+                if cell.has_style:
+                    try:
+                        new_cell.font = cell.font.copy()
+                        new_cell.border = cell.border.copy()
+                        new_cell.fill = cell.fill.copy()
+                        new_cell.number_format = cell.number_format
+                        new_cell.alignment = cell.alignment.copy()
+                    except:
+                        pass
+        for col, dim in src.column_dimensions.items():
+            try:
+                dst.column_dimensions[col].width = dim.width
+            except: pass
+        for row, dim in src.row_dimensions.items():
+            try:
+                dst.row_dimensions[row].height = dim.height
+            except: pass
+        try:
+            for merged_range in src.merged_cells.ranges:
+                dst.merge_cells(str(merged_range))
+        except: pass
+
+    # ======= CORRECCIÓN CLAVE: totales mensuales correctos (sin YTD de diciembre) =======
+    def _build_totales_sheet(self, wb):
+        src_names = [n for n in wb.sheetnames if n.upper() != "TOTALES"]
+        if not src_names:
+            return
+
+        tot_cat = defaultdict(lambda: [0.0]*12)   # categoría x mes
+        tot_prov = defaultdict(lambda: [0.0]*12)  # proveedor x mes
+        tot_mes = [0.0]*12                        # total por mes
+
+        category_order: List[str] = []
+        provider_order = OrderedDict()
+
+        def _is_total_header(txt: str) -> bool:
+            t = (txt or "").strip().lower()
+            return bool(re.search(r"(total|ytd|acumulado|a[ñn]o)", t))
+
+        for nm in src_names:
+            ws = wb[nm]
+            try:
+                mb, _, cat_rows, _ = _scan_template_grid(ws)
+            except Exception:
+                continue
+            if not mb or not cat_rows:
+                continue
+
+            if not category_order:
+                for r in sorted(cat_rows.keys()):
+                    name = str(ws.cell(row=r, column=1).value or "").strip()
+                    if name and "total" not in name.lower():
+                        category_order.append(name)
+
+            total_row = _detect_total_row(ws)
+
+            for mm in range(1, 13):
+                if mm not in mb:
+                    continue
+                c1, c2 = mb[mm]
+
+                prov_cols_block: List[Tuple[str,int]] = []
+                for cc in range(c1, c2+1):
+                    hdr = str(ws.cell(row=5, column=cc).value or "").strip()
+                    if hdr and not _is_total_header(hdr):
+                        prov_cols_block.append((hdr, cc))
+                        if hdr not in provider_order:
+                            provider_order[hdr] = True
+
+                # A) categoría: suma de columnas de proveedores del bloque
+                for r in sorted(cat_rows.keys()):
+                    if r >= total_row:
+                        continue
+                    cat_name = str(ws.cell(row=r, column=1).value or "").strip()
+                    if not cat_name or "total" in cat_name.lower():
+                        continue
+                    s = 0.0
+                    for _, cc in prov_cols_block:
+                        s += _to_float(ws.cell(row=r, column=cc).value)
+                    if s != 0.0:
+                        tot_cat[cat_name][mm-1] += s
+
+                # B) proveedor: usar fila de totales por proveedor (total_row)
+                for prov_name, cc in prov_cols_block:
+                    v = _to_float(ws.cell(row=total_row, column=cc).value)
+                    if v != 0.0:
+                        tot_prov[prov_name][mm-1] += v
+
+                # C) total del mes: suma de total_row solo en columnas de proveedores
+                v_mes = 0.0
+                for _, cc in prov_cols_block:
+                    v_mes += _to_float(ws.cell(row=total_row, column=cc).value)
+                if v_mes != 0.0:
+                    tot_mes[mm-1] += v_mes
+
+        if "TOTALES" in wb.sheetnames:
+            tot_ws = wb["TOTALES"]
+            try:
+                tot_ws.delete_rows(1, tot_ws.max_row)
+            except:
+                pass
+        else:
+            tot_ws = wb.create_sheet("TOTALES")
+
+        def _row(ws, r, c, values):
+            for i, val in enumerate(values):
+                ws.cell(row=r, column=c+i, value=val)
+
+        r = 1
+        _row(tot_ws, r, 1, ["Totales por Categoría (suma de columnas de proveedores por mes, todas las hojas)"]); r += 1
+        headers_A = ["Categoría"] + SPAN_MONTHS + ["Total"]
+        _row(tot_ws, r, 1, headers_A); r += 1
+
+        cats_to_write = category_order[:]
+        for k in tot_cat.keys():
+            if k not in cats_to_write:
+                cats_to_write.append(k)
+
+        for cat in cats_to_write:
+            meses = tot_cat.get(cat, [0.0]*12)
+            total_cat = sum(meses)
+            _row(tot_ws, r, 1, [cat] + [float(m) for m in meses] + [float(total_cat)])
+            r += 1
+
+        r += 1
+        _row(tot_ws, r, 1, ["Totales por Proveedor (fila total por proveedor y mes, todas las hojas)"]); r += 1
+        headers_B = ["Proveedor"] + SPAN_MONTHS + ["Total"]
+        _row(tot_ws, r, 1, headers_B); r += 1
+
+        provs_to_write = list(provider_order.keys())
+        for k in tot_prov.keys():
+            if k not in provs_to_write:
+                provs_to_write.append(k)
+
+        for prov in provs_to_write:
+            meses = tot_prov.get(prov, [0.0]*12)
+            total_prov = sum(meses)
+            _row(tot_ws, r, 1, [prov] + [float(m) for m in meses] + [float(total_prov)])
+            r += 1
+
+        r += 1
+        _row(tot_ws, r, 1, ["Totales por Mes (suma de proveedores por mes, todas las hojas)"]); r += 1
+        headers_C = ["Mes", "Total del Mes", "% del Total"]
+        _row(tot_ws, r, 1, headers_C); r += 1
+        gran_total = float(sum(tot_mes))
+        start_C_data = r
+        for i, mname in enumerate(SPAN_MONTHS):
+            v = float(tot_mes[i])
+            pct = (v/gran_total) if gran_total > 0 else 0.0
+            _row(tot_ws, r, 1, [mname, v, pct])
+            r += 1
+        _row(tot_ws, r, 1, ["Gran Total", float(gran_total)]); r += 1
+
+        try:
+            max_row = tot_ws.max_row
+            max_col = tot_ws.max_column
+            for rr in range(1, max_row+1):
+                for cc in range(1, max_col+1):
+                    cell = tot_ws.cell(row=rr, column=cc)
+                    val = cell.value
+                    if isinstance(val, (int, float)):
+                        cell.number_format = '#,##0'
+            for rr in range(start_C_data, start_C_data + 12):
+                tot_ws.cell(row=rr, column=3).number_format = '0.00%'
+            tot_ws.column_dimensions['A'].width = 36
+            for i in range(12):
+                tot_ws.column_dimensions[get_column_letter(2+i)].width = 14
+            tot_ws.column_dimensions[get_column_letter(14)].width = 16
+        except:
+            pass
+    # ======= FIN CORRECCIÓN =======
+
+    def _go_back(self):
+        self._reset_view()
+        self.backRequested.emit()
+
+    def _kpi(self, title):
+        w=QtWidgets.QFrame(objectName="card")
+        l=QtWidgets.QVBoxLayout(w); l.setContentsMargins(12,10,12,10)
+        l.addWidget(QtWidgets.QLabel(title, objectName="kpiLabel"))
+        val=QtWidgets.QLabel("--", objectName="kpiValue")
+        w.value=val; l.addWidget(val)
+        return w
+
+    def _table(self, headers):
+        t=QtWidgets.QTableWidget(); t.setColumnCount(len(headers)); t.setHorizontalHeaderLabels(headers)
+        t.setFrameShape(QtWidgets.QFrame.NoFrame); t.setShowGrid(False); t.verticalHeader().setVisible(False)
+        t.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        return t
+
+    def _update_button_visibility(self):
+        has_files = (self.df is not None and not self.df.empty) or (self.lst_files.count() > 0)
+        self.btn_remove.setVisible(has_files)
+        self.btn_adv.setVisible(has_files)
+
+    def _reset_view(self):
+        if self.df is not None:
+            self.df = self.df.iloc[0:0].copy()
+        if hasattr(self, "lst_files"):
+            self.lst_files.clear()
+        try:
+            self.kpi_total.value.setText("$ 0")
+            self.kpi_provs.value.setText("0")
+            self.kpi_clients.value.setText("0")
+            self.kpi_vs.value.setText("—")
+        except Exception:
+            pass
+        self._recalc()
+        self._update_button_visibility()
+
+    def _add_files(self):
+        if pd is None:
+            QtWidgets.QMessageBox.information(self,"Dependencia","Instala pandas para importar."); return
+        paths,_=QtWidgets.QFileDialog.getOpenFileNames(self,"Selecciona archivos KAM","","Hojas (*.xlsx *.xls *.csv)")
+        for p in paths: self._append_file(p)
+        self._update_button_visibility()
+
+    def _add_folder(self):
+        if pd is None:
+            QtWidgets.QMessageBox.information(self,"Dependencia","Instala pandas para importar."); return
+        folder=QtWidgets.QFileDialog.getExistingDirectory(self,"Selecciona carpeta con archivos KAM")
+        if not folder: return
+        for name in os.listdir(folder):
+            if name.lower().endswith((".xlsx",".xls",".csv")):
+                path=os.path.join(folder,name)
+                try:
+                    cliente_a1 = ""
+                    if name.lower().endswith((".xlsx",".xls")):
+                        try:
+                            wb = load_workbook(path, data_only=True)
+                            ws = wb.active
+                            cliente_a1 = str(ws["A1"].value or "").strip()
+                        except Exception:
+                            cliente_a1 = ""
+                    cliente_detectado = cliente_a1 if cliente_a1 else self._guess_from_name(path, kind="cliente")
+                    if name.lower().endswith(".csv"):
+                        d=pd.read_csv(path, dtype=str, keep_default_na=False)
+                        frames=[self._normalize_table(d)]
+                    else:
+                        frames=self._read_excel_any(path)
+                    for df in frames:
+                        if df is None or df.empty: continue
+                        df["archivo"]=os.path.basename(path)
+                        if "kam" not in df.columns: df["kam"]=self._guess_from_name(path, kind="kam")
+                        df["cliente"]=cliente_detectado
+                        df["moneda"]="MXN"
+                        self.df = pd.concat([self.df, df], ignore_index=True)
+                    item=QtWidgets.QListWidgetItem(os.path.basename(path)); item.setToolTip(path); self.lst_files.addItem(item)
+                except Exception as e:
+                    QtWidgets.QMessageBox.warning(self,"Importar",f"{os.path.basename(path)}: {e}")
+        self._recalc()
+        self._update_button_visibility()
+
+    def _remove_selected_files(self):
+        if self.df is None: return
+        items = self.lst_files.selectedItems()
+        if not items: return
+        names = [i.text() for i in items]
+        self.df = self.df[~self.df["archivo"].isin(names)].copy()
+        for it in items:
+            row = self.lst_files.row(it)
+            self.lst_files.takeItem(row)
+        self._recalc()
+        self._update_button_visibility()
+
+    def _append_file(self, path):
+        if self.df is None: return
+        item=QtWidgets.QListWidgetItem(os.path.basename(path)); item.setToolTip(path); self.lst_files.addItem(item)
+        try:
+            if path.lower().endswith(".csv"):
+                df=pd.read_csv(path, dtype=str, keep_default_na=False)
+                norm=self._normalize_table(df)
+                frames=[norm]
+            else:
+                frames=self._read_excel_any(path)
+            for df in frames:
+                if df is None or df.empty: continue
+                df["archivo"]=os.path.basename(path)
+                if "kam" not in df.columns: df["kam"]=self._guess_from_name(path, kind="kam")
+                if path.lower().endswith((".xlsx",".xls")):
+                    try:
+                        wb_src=load_workbook(path, data_only=True); ws_src=wb_src.active
+                        a1=str(ws_src["A1"].value or "").strip()
+                    except Exception:
+                        a1=""
+                    df["cliente"]= a1 if a1 else self._guess_from_name(path, kind="cliente")
+                else:
+                    df["cliente"]= self._guess_from_name(path, kind="cliente")
+                df["moneda"]="MXN"
+                self.df = pd.concat([self.df, df], ignore_index=True)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self,"Importar",f"{os.path.basename(path)}: {e}")
+        self._recalc()
+
+    def _read_excel_any(self, path):
+        xls = pd.ExcelFile(path)
+        frames=[]
+        default_year=self._year_from_filename(path)
+        for sh in xls.sheet_names:
+            raw=pd.read_excel(path, sheet_name=sh, header=None, dtype=object)
+            df_tpl=self._parse_epo_template_sheet(raw, sh, default_year)
+            if df_tpl is not None and not df_tpl.empty:
+                frames.append(df_tpl); continue
+            try:
+                df_named=pd.read_excel(path, sheet_name=sh, dtype=str, header=0)
+                if df_named is not None and not df_named.empty:
+                    norm=self._normalize_table(df_named, sheet_name=sh)
+                    if norm is not None and not norm.empty:
+                        frames.append(norm)
+            except Exception:
+                pass
+        return frames
+
+    def _parse_epo_template_sheet(self, raw_df, sheet_name: str, default_year: int):
+        if raw_df is None or raw_df.empty: return pd.DataFrame(columns=["proveedor","categoria","mes","valor"])
+        df = raw_df.fillna("")
+        header_row=None; cat_col_idx=None
+        for i in range(min(30, len(df))):
+            row_lower=[str(c).strip().lower() for c in df.iloc[i].tolist()]
+            if "categoría" in row_lower or "categoria" in row_lower:
+                header_row=i
+                cat_col_idx = (row_lower.index("categoría") if "categoría" in row_lower else row_lower.index("categoria"))
+                break
+        if header_row is None or cat_col_idx is None:
+            return pd.DataFrame(columns=["proveedor","categoria","mes","valor"])
+        month_row=None
+        for r in range(header_row-1, max(-1, header_row-4), -1):
+            if r<0: break
+            cells=[str(c).strip().lower() for c in df.iloc[r].tolist()]
+            if any(any(k in c for k in MONTHS_MAP.keys()) for c in cells):
+                month_row=r; break
+        if month_row is None:
+            return pd.DataFrame(columns=["proveedor","categoria","mes","valor"])
+        month_cells=[str(c).strip().lower() for c in df.iloc[month_row].tolist()]
+        months_by_col={}
+        current=""
+        for j,cell in enumerate(month_cells):
+            detected=None
+            for k,v in MONTHS_MAP.items():
+                if k in cell and cell!="":
+                    detected=v; break
+            if detected:
+                current=f"{int(default_year):04d}-{int(detected):02d}"
+            months_by_col[j]=current
+        out_rows=[]
+        for i in range(header_row+1, len(df)):
+            first_cell = str(df.iat[i, cat_col_idx]).strip()
+            if first_cell == "":
+                if i>header_row+2 and str(df.iat[i-1, cat_col_idx]).strip() == "":
+                    break
+                continue
+            if "total" in first_cell.lower(): break
+            categoria=first_cell
+            for j in range(cat_col_idx+1, df.shape[1]):
+                prov_name=str(df.iat[header_row, j]).strip()
+                if prov_name=="" or "total" in prov_name.lower(): continue
+                mes_txt=months_by_col.get(j, "")
+                if mes_txt=="": continue
+                val=_to_float(df.iat[i, j])
+                if val!=0.0:
+                    out_rows.append((prov_name, categoria, mes_txt, val))
+        if not out_rows: return pd.DataFrame(columns=["proveedor","categoria","mes","valor"])
+        out=pd.DataFrame(out_rows, columns=["proveedor","categoria","mes","valor"])
+        out["proveedor"]=out["proveedor"].astype(str).str.strip()
+        out["categoria"]=out["categoria"].astype(str).str.strip()
+        return out
+
+    def _normalize_table(self, df, sheet_name=None):
+        cols=[str(c).strip() for c in df.columns]; df.columns=cols
+        def _guess_cols(cols):
+            iv=im=ip=ic=None
+            for c in cols:
+                lc=c.lower()
+                if ic is None and re.search(r"(categ|familia|línea|linea|producto|item)",lc): ic=c
+                if ip is None and re.search(r"(prove|vendor|marca|brand|supplier)",lc): ip=c
+                if iv is None and re.search(r"(monto|valor|importe|amount|total|epo)",lc): iv=c
+                if im is None and re.search(r"(mes|month|fecha|periodo|per[ií]odo)",lc): im=c
+            return ip,ic,im,iv
+        ip,ic,im,iv=_guess_cols(cols)
+        if all(x is not None for x in (ip,ic,im,iv)):
+            out=pd.DataFrame({
+                "proveedor": df[ip].astype(str).str.strip(),
+                "categoria": df[ic].astype(str).str.strip(),
+                "mes": df[im].astype(str),
+                "valor": df[iv].apply(_to_float)
+            })
+            out=out[out["mes"]!=""]
+            return out
+        return pd.DataFrame(columns=["proveedor","categoria","mes","valor"])
+
+    def _guess_from_name(self, path, kind="kam"):
+        name=os.path.splitext(os.path.basename(path))[0]
+        parts=re.split(r"[-_]", name)
+        if kind=="kam":
+            for p in parts:
+                if p.lower().startswith(("kam","asesor")): return p
+            return parts[0] if parts else ""
+        else:
+            if len(parts)>1: return parts[1]
+            return ""
+
+    def _year_from_filename(self, path: str, fallback=None) -> int:
+        m = re.search(r"(20\d{2})", os.path.basename(path))
+        return int(m.group(1)) if m else (fallback if fallback is not None else dt.date.today().year)
+
+    def _load_base(self):
+        if pd is None:
+            QtWidgets.QMessageBox.information(self,"Dependencia","Instala pandas para importar."); return
+        path,_=QtWidgets.QFileDialog.getOpenFileName(self,"Cargar base","","Hojas (*.xlsx *.xls *.csv)")
+        if not path: return
+        try:
+            frames=[]
+            if path.lower().endswith(".csv"):
+                d=pd.read_csv(path, dtype=str, keep_default_na=False)
+                frames=[self._normalize_table(d)]
+            else:
+                xl=pd.ExcelFile(path)
+                guess_year=self._year_from_filename(path)
+                for sh in xl.sheet_names:
+                    raw=pd.read_excel(path, sheet_name=sh, header=None, dtype=object)
+                    df_tpl=self._parse_epo_template_sheet(raw, sh, guess_year)
+                    if df_tpl is not None and not df_tpl.empty:
+                        frames.append(df_tpl); continue
+                    try:
+                        n=pd.read_excel(path, sheet_name=sh, dtype=str)
+                        n=self._normalize_table(n)
+                        if n is not None and not n.empty:
+                            frames.append(n)
+                    except Exception:
+                        pass
+            if not frames:
+                QtWidgets.QMessageBox.warning(self,"Base","No se detectaron datos compatibles en el archivo."); return
+            base_all=pd.concat(frames, ignore_index=True)
+            base_all=base_all[base_all["mes"]!=""].copy()
+            base_all["valor"]=base_all["valor"].astype(float)
+            if base_all.empty:
+                QtWidgets.QMessageBox.warning(self,"Base","No se encontraron columnas de Mes/Valor en formato compatible."); return
+            years = base_all["mes"].str[:4].dropna().astype(int)
+            self.base_year = int(years.mode().iat[0]) if not years.empty else self._year_from_filename(path)
+            self.base_prov = base_all.groupby("proveedor", as_index=False)["valor"].sum()
+            self.base_prov.columns=["proveedor","valor"]
+            self.base_month = base_all.groupby("mes", as_index=False)["valor"].sum()
+            QtWidgets.QMessageBox.information(self,"Base","Base cargada.")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self,"Base",str(e))
+        self._recalc()
+
+    def _switch_group_mode(self, txt):
+        self.group_mode = "proveedor" if (txt or "").lower().startswith("prove") else "mes"
+        self._recalc()
+
+    def _recalc(self, force=False):
+        if self.df is None or self.df.empty:
+            self.kpi_total.value.setText("$ 0")
+            self.kpi_provs.value.setText("0")
+            self.kpi_clients.value.setText("0")
+            if self.base_month is not None and not self.base_month.empty:
+                sum_base=float(self.base_month["valor"].sum())
+                self.kpi_vs.value.setText(f"{((0.0/sum_base)-1.0)*100:,.2f}%" if sum_base>0 else "—")
+            else:
+                self.kpi_vs.value.setText("—")
+            self.curr_year=dt.date.today().year
+            if self.group_mode=="proveedor":
+                self._fill_main_table(pd.DataFrame(columns=["proveedor","EPO","Base","Diff"]), mode="proveedor")
+            else:
+                self._fill_main_table(pd.DataFrame(columns=["Mes","EPO","Base","Diff"]), mode="mes")
+            return
+        d=self.df.copy(); d["valor"]=d["valor"].astype(float)
+        if "mes" in d.columns and not d["mes"].eq("").all():
+            yseries = d.loc[d["mes"]!="","mes"].str[:4].astype(int)
+            self.curr_year = int(yseries.mode().iat[0]) if not yseries.empty else dt.date.today().year
+        else:
+            self.curr_year = dt.date.today().year
+        total=float(d["valor"].sum())
+        self.kpi_total.value.setText(f"$ {total:,.0f}")
+        self.kpi_provs.value.setText(f"{d[d['proveedor']!='']['proveedor'].nunique():,}")
+        self.kpi_clients.value.setText(f"{d['cliente'].nunique():,}")
+        if self.base_month is not None and not self.base_month.empty:
+            mes=d[d["mes"]!=""].groupby("mes", as_index=False)["valor"].sum().rename(columns={"valor":"EPO"})
+            bm=self.base_month.copy(); bm["mm"]=bm["mes"].str[-2:]
+            mes["mm"]=mes["mes"].str[-2:]
+            m_join=mes.merge(bm[["mm","valor"]].rename(columns={"valor":"Base"}), on="mm", how="left")
+            sum_curr=float(m_join["EPO"].sum())
+            sum_base=float(m_join["Base"].fillna(0.0).sum())
+            self.kpi_vs.value.setText(f"{((sum_curr/sum_base)-1.0)*100:,.2f}%" if sum_base>0 else "—")
+        else:
+            self.kpi_vs.value.setText("—")
+        if self.group_mode=="proveedor":
+            prov=d[d["proveedor"]!=""].groupby("proveedor", as_index=False).agg({"valor":"sum"}).rename(columns={"valor":"EPO"})
+            if self.base_prov is not None and not self.base_prov.empty:
+                b=self.base_prov.rename(columns={"valor":"Base"})
+                prov=prov.merge(b, on="proveedor", how="left").fillna({"Base":0.0})
+            else:
+                prov["Base"]=0.0
+            prov["Diff"]=prov["EPO"]-prov["Base"]
+            prov=prov.sort_values("EPO", ascending=False)
+            self._fill_main_table(prov, mode="proveedor")
+        else:
+            mlist=[]
+            for i in range(12):
+                mm=f"{i+1:02d}"
+                epo=float(d.loc[d["mes"].str[-2:]==mm,"valor"].sum())
+                base=0.0
+                if self.base_month is not None and not self.base_month.empty:
+                    base=float(self.base_month.loc[self.base_month["mes"].str[-2:]==mm,"valor"].sum())
+                mlist.append({"Mes":SPAN_MONTHS[i],"EPO":epo,"Base":base,"Diff":epo-base})
+            self._fill_main_table(pd.DataFrame(mlist), mode="mes")
+
+    def _fill_main_table(self, df, mode="proveedor"):
+        base_lbl = f"Ventas Base{(' ' + str(self.base_year)) if self.base_year else ''}"
+        curr_lbl = f"EPO Año{(' ' + str(self.curr_year)) if self.curr_year else ''}"
+        diff_lbl = "Diferencia vs Base"
+        if mode=="proveedor":
+            self.lbl_main_title.setText("Totales por proveedor")
+            headers=["Proveedor", base_lbl, curr_lbl, diff_lbl]
+            self.tbl_main.setRowCount(0); self.tbl_main.setColumnCount(len(headers)); self.tbl_main.setHorizontalHeaderLabels(headers)
+            if df is None or df.empty: return
+            self.tbl_main.setRowCount(len(df))
+            for r,row in enumerate(df.itertuples(index=False)):
+                proveedor=getattr(row,"proveedor","")
+                base=float(getattr(row,"Base",0.0)); epo=float(getattr(row,"EPO",0.0)); diff=float(getattr(row,"Diff",epo-base))
+                self.tbl_main.setItem(r,0,QtWidgets.QTableWidgetItem(str(proveedor)))
+                self.tbl_main.setItem(r,1,QtWidgets.QTableWidgetItem(f"{base:,.0f}"))
+                self.tbl_main.setItem(r,2,QtWidgets.QTableWidgetItem(f"{epo:,.0f}"))
+                self.tbl_main.setItem(r,3,QtWidgets.QTableWidgetItem(f"{diff:,.0f}"))
+        else:
+            self.lbl_main_title.setText("Totales por mes")
+            headers=["Mes", curr_lbl, base_lbl, diff_lbl]
+            self.tbl_main.setRowCount(0); self.tbl_main.setColumnCount(len(headers)); self.tbl_main.setHorizontalHeaderLabels(headers)
+            if df is None or df.empty: return
+            self.tbl_main.setRowCount(len(df))
+            for r,row in enumerate(df.itertuples(index=False)):
+                mes=str(getattr(row,"Mes",""))
+                epo=float(getattr(row,"EPO",0.0)); base=float(getattr(row,"Base",0.0)); diff=float(getattr(row,"Diff",epo-base))
+                self.tbl_main.setItem(r,0,QtWidgets.QTableWidgetItem(mes))
+                self.tbl_main.setItem(r,1,QtWidgets.QTableWidgetItem(f"{epo:,.0f}"))
+                self.tbl_main.setItem(r,2,QtWidgets.QTableWidgetItem(f"{base:,.0f}"))
+                self.tbl_main.setItem(r,3,QtWidgets.QTableWidgetItem(f"{diff:,.0f}"))
+
+    def _open_full_format(self):
+        if pd is None: return
+        df = None if (self.df is None or self.df.empty) else self.df[["proveedor","categoria","mes","valor"]]
+        FullFormatDialog(self, df=df).exec()
+
+    def _export_total(self, mode="epo"):
+        if Workbook is None:
+            QtWidgets.QMessageBox.information(self,"Exportar","Instala openpyxl para exportar a Excel."); return
+        if mode == "kam":
+            try:
+                self._run_kam_flow()
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self,"Reporte KAM",str(e))
+            return
+        try:
+            src_paths,_ = QtWidgets.QFileDialog.getOpenFileNames(self, "Selecciona archivos EPO", "", "Excel (*.xlsx *.xlsm *.xls)")
+            if not src_paths:
+                QtWidgets.QMessageBox.information(self, "EPO Ventas", "No seleccionaste archivos")
+                return
+            out_path,_ = QtWidgets.QFileDialog.getSaveFileName(self, "Guardar consolidado", "EPO_Ventas.xlsx", "Excel (*.xlsx)")
+            if not out_path:
+                return
+            out_wb = Workbook()
+            try:
+                out_wb.remove(out_wb.active)
+            except:
+                pass
+
+            for path in src_paths:
+                try:
+                    wb = load_workbook(path, data_only=True)
+                except Exception as e:
+                    QtWidgets.QMessageBox.warning(self,"EPO Ventas",f"No se pudo abrir {os.path.basename(path)}: {e}")
+                    continue
+                for ws in wb.worksheets:
+                    a1 = str(ws["A1"].value or "").strip()
+                    base_name = a1 if a1 else (ws.title.strip() if ws.title else os.path.splitext(os.path.basename(path))[0])
+                    title = _safe_sheet_name(base_name)
+                    if title in out_wb.sheetnames:
+                        i = 2
+                        while f"{title} ({i})" in out_wb.sheetnames:
+                            i += 1
+                        title = f"{title} ({i})"
+                    new_ws = out_wb.create_sheet(title)
+                    self._copy_worksheet(new_ws, ws)
+
+            # Construir hoja TOTALES con la corrección
+            self._build_totales_sheet(out_wb)
+
+            out_wb.save(out_path)
+            QtWidgets.QMessageBox.information(self,"EPO Ventas","Consolidado generado con hojas copiadas y hoja TOTALES.")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self,"EPO Ventas", f"Error: {str(e)}")
+
+    def _run_kam_flow(self):
+        if pd is None or Workbook is None:
+            QtWidgets.QMessageBox.information(self,"Reporte KAM","Requiere pandas y openpyxl instalados.")
+            return
+        mode_items = ["Reemplazar mes", "Sumar al mes"]
+        mode, ok = QtWidgets.QInputDialog.getItem(
+            self, "Modo de escritura", "¿Cómo aplicar los valores al mes detectado?",
+            mode_items, 0, False
+        )
+        if not ok:
+            return
+        add_mode = (mode == mode_items[1])
+        editable_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Selecciona EDITABLE.xlsx", "", "Excel (*.xlsx *.xls)"
+        )
+        if not editable_path:
+            return
+        dest_existing_path = None
+        if add_mode:
+            dest_existing_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Selecciona archivo EPO DESTINO (donde se sumará)", "", "Excel (*.xlsx *.xls)"
+            )
+            if not dest_existing_path:
+                return
+        opciones = ["OFFICE DEPOT MEXICO","LUMEN","COPPEL","WALMART","SEARS","OTRO"]
+        cliente, ok = QtWidgets.QInputDialog.getItem(
+            self, "Cliente", "Selecciona el cliente:", opciones, 0, True
+        )
+        if not ok or not cliente:
+            return
+        mes_str, year, month = _detect_mes_anio_from_editable(editable_path)
+        if not mes_str:
+            QtWidgets.QMessageBox.information(
+                self, "Reporte KAM",
+                "No se pudo detectar Mes/Año en H1. Formato esperado (ej. '02 de Octubre de 2025')."
+            )
+            return
+        try:
+            df = pd.read_excel(editable_path, sheet_name=0, header=None, dtype=object)
+            df = df.fillna("")
+            categorias = df.iloc[:, 1].astype(str).tolist() if df.shape[1] >= 2 else []
+            proveedores = df.iloc[:, 2].astype(str).tolist() if df.shape[1] >= 3 else []
+            valores     = df.iloc[:, 8].tolist()           if df.shape[1] >= 9 else []
+            pairs = []
+            for cat, prov, val in zip(categorias, proveedores, valores):
+                cat_n = _norm_text(cat); prov_n = _norm_text(prov); v = _to_float(val)
+                if cat_n and prov_n and v != 0.0:
+                    pairs.append((str(cat).strip(), _apply_alias(str(prov).strip()), v))
+            if add_mode:
+                wb = load_workbook(dest_existing_path)
+                ws = wb["Formato"] if "Formato" in wb.sheetnames else wb.active
+            else:
+                template_path = _get_template_path()
+                wb = load_workbook(template_path)
+                ws = wb["Formato"] if "Formato" in wb.sheetnames else wb.active
+            ws["A1"] = cliente
+            month_blocks, _, _, _ = _scan_template_grid(ws)
+            if month not in month_blocks:
+                raise RuntimeError("No se encontró el bloque del mes en la plantilla/destino.")
+            col_ini, col_fin = month_blocks[month]
+            cat_map, prov_map = _make_maps_by_name(ws)
+            prov_relaxed = getattr(ws, "_prov_relaxed", {})
+            cat_relaxed  = getattr(ws, "_cat_relaxed", {})
+            prov_keys_rel = list(prov_relaxed.keys())
+            cat_keys_rel  = list(cat_relaxed.keys())
+            written_ct = 0; skipped_ct = 0; sum_in = 0.0; sum_written = 0.0; skipped_rows = []
+            for cat, prov_raw, v in pairs:
+                sum_in += float(v)
+                prov = prov_raw
+                r = cat_map.get(_norm_text(cat))
+                if r is None:
+                    r = cat_relaxed.get(_norm_relaxed(cat))
+                if r is None:
+                    k = _best_match_relaxed(cat, cat_keys_rel, min_sim=0.55)
+                    if k is not None:
+                        r = cat_relaxed.get(k)
+                if r is None:
+                    skipped_ct += 1; skipped_rows.append((cat, prov, v, "Categoría no encontrada")); continue
+                c = prov_map.get(_norm_text(prov))
+                if c is None:
+                    c = prov_relaxed.get(_norm_relaxed(prov))
+                target_c = None
+                if c is not None and (col_ini <= c <= col_fin):
+                    target_c = c
+                else:
+                    prov_rel = _norm_relaxed(prov)
+                    for cc in range(col_ini, col_fin + 1):
+                        name = str(ws.cell(row=5, column=cc).value or "").strip()
+                        if not name or "total" in name.lower(): continue
+                        name_rel = _norm_relaxed(name)
+                        if name_rel == prov_rel or prov_rel in name_rel or name_rel in prov_rel:
+                            target_c = cc; break
+                    if target_c is None:
+                        best_cc = None; best_sc = 0.0
+                        for cc in range(col_ini, col_fin + 1):
+                            name = str(ws.cell(row=5, column=cc).value or "").strip()
+                            if not name or "total" in name.lower(): continue
+                            sc = _jaccard(prov, name)
+                            if sc > best_sc: best_sc = sc; best_cc = cc
+                        if best_sc >= 0.55:
+                            target_c = best_cc
+                if target_c is None:
+                    skipped_ct += 1; skipped_rows.append((cat, prov, v, "Proveedor no encontrado")); continue
+                cell = ws.cell(row=r, column=target_c)
+                if add_mode:
+                    prev = _to_float(cell.value)
+                    cell.value = prev + float(v)
+                else:
+                    cell.value = float(v)
+                sum_written += float(v); written_ct += 1
+            if add_mode:
+                suggested = os.path.splitext(os.path.basename(dest_existing_path))[0]
+                out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self, "Guardar (sumado)", f"{suggested}_sumado.xlsx", "Excel (*.xlsx)"
+                )
+            else:
+                out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self, "Guardar reporte", f"EPO_{year}_{cliente}.xlsx", "Excel (*.xlsx)"
+                )
+            if not out_path:
+                return
+            wb.save(out_path)
+            msg = (f"Cliente: {cliente}\n"
+                   f"Mes detectado: {SPAN_MONTHS[month-1]} {year}\n"
+                   f"Modo: {mode}\n"
+                   f"Filas leídas: {len(pairs):,}\n"
+                   f"Celdas escritas: {written_ct:,}\n"
+                   f"Sin coincidencia: {skipped_ct:,}\n"
+                   f"\nTotal EDITABLE: $ {sum_in:,.0f}\n"
+                   f"Total escrito:  $ {sum_written:,.0f}\n"
+                   f"Diferencia:     $ {sum_in - sum_written:,.0f}\n"
+                   f"\nArchivo guardado:\n{out_path}")
+            QtWidgets.QMessageBox.information(self, "Reporte KAM - Auditoría", msg)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Reporte KAM", str(e))
+
+    def resizeEvent(self, e: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(e)
+
+if __name__=="__main__":
+    app=QtWidgets.QApplication([])
+    w=EpoConsolidador(); w.resize(1280,760); w.show()
+    app.exec()
